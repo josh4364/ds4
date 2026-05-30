@@ -17211,6 +17211,20 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    pthread_t mtp_thread;
+    bool mtp_async_running;
+    pthread_mutex_t mtp_mutex;
+    pthread_cond_t mtp_cond_start;
+    pthread_cond_t mtp_cond_done;
+    bool mtp_thread_exit;
+    bool mtp_thread_active;
+    struct {
+        int token;
+        uint32_t pos;
+        float *logits;
+        int mtp_top;
+        bool success;
+    } mtp_arg;
 };
 
 /* =========================================================================
@@ -19572,6 +19586,9 @@ void ds4_engine_close(ds4_engine *e) {
     free(e);
 }
 
+static void ds4_session_sync_mtp_draft(ds4_session *s);
+static void *mtp_persistent_worker(void *ptr);
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -19619,6 +19636,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
+        pthread_mutex_init(&s->mtp_mutex, NULL);
+        pthread_cond_init(&s->mtp_cond_start, NULL);
+        pthread_cond_init(&s->mtp_cond_done, NULL);
+        s->mtp_thread_exit = false;
+        s->mtp_thread_active = false;
+        pthread_create(&s->mtp_thread, NULL, mtp_persistent_worker, s);
     }
     if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
         char err[256];
@@ -19646,6 +19669,18 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    ds4_session_sync_mtp_draft(s);
+    if (s->engine && s->engine->mtp_ready) {
+        pthread_mutex_lock(&s->mtp_mutex);
+        s->mtp_thread_exit = true;
+        s->mtp_thread_active = false;
+        pthread_cond_signal(&s->mtp_cond_start);
+        pthread_mutex_unlock(&s->mtp_mutex);
+        pthread_join(s->mtp_thread, NULL);
+        pthread_mutex_destroy(&s->mtp_mutex);
+        pthread_cond_destroy(&s->mtp_cond_start);
+        pthread_cond_destroy(&s->mtp_cond_done);
+    }
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
@@ -20444,6 +20479,52 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     return 0;
 }
 
+static void *mtp_persistent_worker(void *ptr) {
+    ds4_session *s = (ds4_session *)ptr;
+    ds4_engine *e = s->engine;
+    pthread_mutex_lock(&s->mtp_mutex);
+    while (!s->mtp_thread_exit) {
+        while (!s->mtp_thread_active && !s->mtp_thread_exit) {
+            pthread_cond_wait(&s->mtp_cond_start, &s->mtp_mutex);
+        }
+        if (s->mtp_thread_exit) break;
+
+        pthread_mutex_unlock(&s->mtp_mutex);
+
+        s->mtp_arg.success = metal_graph_eval_mtp_draft(&s->graph,
+                                                        &e->model,
+                                                        &e->weights,
+                                                        &e->mtp_model,
+                                                        &e->mtp_weights,
+                                                        s->mtp_arg.token,
+                                                        s->mtp_arg.pos,
+                                                        s->mtp_arg.logits,
+                                                        &s->mtp_arg.mtp_top);
+
+        pthread_mutex_lock(&s->mtp_mutex);
+        s->mtp_thread_active = false;
+        pthread_cond_signal(&s->mtp_cond_done);
+    }
+    pthread_mutex_unlock(&s->mtp_mutex);
+    return NULL;
+}
+
+static void ds4_session_sync_mtp_draft(ds4_session *s) {
+    if (s && s->mtp_async_running) {
+        pthread_mutex_lock(&s->mtp_mutex);
+        while (s->mtp_thread_active) {
+            pthread_cond_wait(&s->mtp_cond_done, &s->mtp_mutex);
+        }
+        s->mtp_async_running = false;
+        pthread_mutex_unlock(&s->mtp_mutex);
+
+        if (s->mtp_arg.success) {
+            s->mtp_draft_token = s->mtp_arg.mtp_top >= 0 ? s->mtp_arg.mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+            s->mtp_draft_valid = true;
+        }
+    }
+}
+
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
@@ -20486,6 +20567,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     snprintf(err, errlen, "GPU support is not compiled in");
     return 1;
 #else
+    ds4_session_sync_mtp_draft(s);
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
@@ -20515,21 +20597,16 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     token_vec_push(&s->checkpoint, token);
     if (mtp_should_draft) {
-        int mtp_top = -1;
-        if (metal_graph_eval_mtp_draft(&s->graph,
-                                       &e->model,
-                                       &e->weights,
-                                       &e->mtp_model,
-                                       &e->mtp_weights,
-                                       token,
-                                       (uint32_t)(s->checkpoint.len - 1),
-                                       getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
-                                       &mtp_top)) {
-            s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
-            s->mtp_draft_valid = true;
-        } else if (getenv("DS4_MTP_PROBE")) {
-            fprintf(stderr, "ds4: mtp probe draft failed\n");
-        }
+        pthread_mutex_lock(&s->mtp_mutex);
+        s->mtp_arg.token = token;
+        s->mtp_arg.pos = (uint32_t)(s->checkpoint.len - 1);
+        s->mtp_arg.logits = getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL;
+        s->mtp_arg.mtp_top = -1;
+        s->mtp_arg.success = false;
+        s->mtp_thread_active = true;
+        s->mtp_async_running = true;
+        pthread_cond_signal(&s->mtp_cond_start);
+        pthread_mutex_unlock(&s->mtp_mutex);
     }
     return 0;
 #endif
@@ -20582,6 +20659,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * draft token is correctness-safe but cannot be faster than baseline.
      */
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    ds4_session_sync_mtp_draft(s);
     int n_accept = 0;
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
@@ -21133,12 +21211,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+    ds4_session_sync_mtp_draft(s);
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    ds4_session_sync_mtp_draft(s);
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
