@@ -80,6 +80,12 @@ static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
+
+static int g_mtp_fd = -1;
+static const void *g_mtp_fd_host_base = NULL;
+static int g_mtp_direct_fd = -1;
+static uint64_t g_mtp_direct_align = 1;
+static uint64_t g_mtp_file_size = 0;
 static int g_model_cache_full;
 static int g_model_mapping_failure_notice_printed;
 static cudaStream_t g_model_prefetch_stream;
@@ -882,11 +888,12 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 #endif
 }
 
-static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
+static void cuda_model_drop_file_pages(int fd, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
-    (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
+    if (fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    (void)posix_fadvise(fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
+    (void)fd;
     (void)offset;
     (void)bytes;
 #endif
@@ -966,21 +973,24 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     return 1;
 }
 
-static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
+static int cuda_model_stage_read(int fd, int *p_direct_fd, uint64_t *p_align, uint64_t file_size,
+                                 void *stage, uint64_t stage_bytes,
                                  uint64_t offset, uint64_t bytes,
                                  const char **payload) {
     *payload = (const char *)stage;
 #if defined(__linux__) && defined(O_DIRECT)
-    if (g_model_direct_fd >= 0 && g_model_direct_align > 1 && g_model_file_size != 0) {
-        const uint64_t aligned_off = cuda_round_down(offset, g_model_direct_align);
+    int direct_fd = p_direct_fd ? *p_direct_fd : -1;
+    uint64_t align = p_align ? *p_align : 1;
+    if (direct_fd >= 0 && align > 1 && file_size != 0) {
+        const uint64_t aligned_off = cuda_round_down(offset, align);
         const uint64_t delta = offset - aligned_off;
-        uint64_t read_size = cuda_round_up(delta + bytes, g_model_direct_align);
-        if (aligned_off <= g_model_file_size &&
+        uint64_t read_size = cuda_round_up(delta + bytes, align);
+        if (aligned_off <= file_size &&
             read_size <= stage_bytes &&
-            read_size <= g_model_file_size - aligned_off) {
+            read_size <= file_size - aligned_off) {
             const int saved_errno = errno;
             errno = 0;
-            if (cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            if (cuda_pread_full(direct_fd, stage, read_size, aligned_off)) {
                 *payload = (const char *)stage + delta;
                 errno = saved_errno;
                 return 1;
@@ -990,9 +1000,9 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA direct model read disabled: %s\n", strerror(direct_errno));
                 }
-                (void)close(g_model_direct_fd);
-                g_model_direct_fd = -1;
-                g_model_direct_align = 1;
+                (void)close(direct_fd);
+                if (p_direct_fd) *p_direct_fd = -1;
+                if (p_align) *p_align = 1;
             }
             errno = direct_errno;
         }
@@ -1000,7 +1010,7 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
 #else
     (void)stage_bytes;
 #endif
-    return cuda_pread_full(g_model_fd, stage, bytes, offset);
+    return cuda_pread_full(fd, stage, bytes, offset);
 }
 
 static uint64_t cuda_model_cache_limit_bytes(void) {
@@ -1111,8 +1121,25 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
-    if (g_model_fd < 0 || bytes == 0) return NULL;
-    if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
+    int fd = -1;
+    int *p_direct_fd = NULL;
+    uint64_t *p_align = NULL;
+    uint64_t file_size = 0;
+
+    if (g_model_fd_host_base != NULL && model_map == g_model_fd_host_base) {
+        fd = g_model_fd;
+        p_direct_fd = &g_model_direct_fd;
+        p_align = &g_model_direct_align;
+        file_size = g_model_file_size;
+    } else if (g_mtp_fd_host_base != NULL && model_map == g_mtp_fd_host_base) {
+        fd = g_mtp_fd;
+        p_direct_fd = &g_mtp_direct_fd;
+        p_align = &g_mtp_direct_align;
+        file_size = g_mtp_file_size;
+    }
+
+    if (fd < 0 || bytes == 0) return NULL;
+
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -1132,7 +1159,8 @@ static const char *cuda_model_range_ptr_from_fd(
     cudaError_t err = cudaSuccess;
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    const uint64_t align_val = p_align ? *p_align : 1;
+    const uint64_t stage_bytes = chunk + (align_val > 1 ? align_val : 1);
     if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
 
     uint64_t copied = 0;
@@ -1150,7 +1178,8 @@ static const char *cuda_model_range_ptr_from_fd(
             }
         }
         const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+        if (!cuda_model_stage_read(fd, p_direct_fd, p_align, file_size,
+                                   g_model_stage[bi], g_model_stage_bytes,
                                    offset + copied, n, &payload)) {
             fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
                     what ? what : "weights",
@@ -1175,7 +1204,7 @@ static const char *cuda_model_range_ptr_from_fd(
             (void)cudaGetLastError();
             return NULL;
         }
-        cuda_model_drop_file_pages(offset + copied, n);
+        cuda_model_drop_file_pages(fd, offset + copied, n);
         cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
         copied += n;
         cuda_model_load_progress_note(g_model_range_bytes + copied);
@@ -1556,6 +1585,9 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
+    if (g_mtp_fd >= 0 && g_mtp_fd_host_base == NULL && model_map != g_model_fd_host_base) {
+        g_mtp_fd_host_base = model_map;
+    }
     return 1;
 }
 
@@ -1687,6 +1719,42 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
                 }
             } else if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                 fprintf(stderr, "ds4: CUDA model direct I/O unavailable: %s\n", strerror(errno));
+            }
+        }
+#endif
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_set_mtp_fd(int fd) {
+    g_mtp_fd = fd;
+    g_mtp_fd_host_base = NULL;
+    g_mtp_file_size = 0;
+    if (g_mtp_direct_fd >= 0) {
+        (void)close(g_mtp_direct_fd);
+        g_mtp_direct_fd = -1;
+    }
+    g_mtp_direct_align = 1;
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size > 0) {
+            g_mtp_file_size = (uint64_t)st.st_size;
+            if (st.st_blksize > 1) g_mtp_direct_align = (uint64_t)st.st_blksize;
+        }
+#if defined(__linux__) && defined(O_DIRECT)
+        if (getenv("DS4_CUDA_NO_DIRECT_IO") == NULL) {
+            char proc_path[64];
+            snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+            int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
+            if (direct_fd >= 0) {
+                g_mtp_direct_fd = direct_fd;
+                if (g_mtp_direct_align < 512) g_mtp_direct_align = 512;
+                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                    fprintf(stderr, "ds4: CUDA MTP direct I/O enabled (align=%llu)\n",
+                            (unsigned long long)g_mtp_direct_align);
+                }
+            } else if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                fprintf(stderr, "ds4: CUDA MTP direct I/O unavailable: %s\n", strerror(errno));
             }
         }
 #endif

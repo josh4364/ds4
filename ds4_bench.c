@@ -41,6 +41,9 @@ typedef struct {
     ds4_dist_options dist;
     bool warm_weights;
     bool quality;
+    const char *mtp_path;
+    int mtp_draft_tokens;
+    double mtp_margin;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -159,6 +162,8 @@ static bench_config parse_options(int argc, char **argv) {
         .step_incr = 2048,
         .gen_tokens = 128,
         .step_mul = 1.0,
+        .mtp_draft_tokens = 1,
+        .mtp_margin = 3.0,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -230,6 +235,12 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            c.mtp_margin = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -457,6 +468,9 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .distributed = cfg.dist,
+        .mtp_path = cfg.mtp_path,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
+        .mtp_margin = (float)cfg.mtp_margin,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
@@ -555,7 +569,7 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        for (int i = 0; i < cfg.gen_tokens; ) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -567,10 +581,29 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            if (ds4_engine_mtp_draft_tokens(engine) > 1 && getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+                int toks[17];
+                int ntok = ds4_session_eval_speculative_argmax(session,
+                                                               token,
+                                                               cfg.gen_tokens - i,
+                                                               eos,
+                                                               toks,
+                                                               (int)(sizeof(toks) / sizeof(toks[0])),
+                                                               err,
+                                                               sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "ds4-bench: speculative decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                i += ntok;
+            } else {
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                i++;
             }
         }
         const double gen_t1 = bench_now_sec();

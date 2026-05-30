@@ -9425,6 +9425,8 @@ typedef struct {
     double decode_token_avg_sec;
     bool quality;
     bool mtp_enabled;
+    uint32_t *comp_counts_buf;
+    uint32_t *index_counts_buf;
 } ds4_gpu_graph;
 
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
@@ -9596,6 +9598,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->hc_mix);
     ds4_gpu_tensor_free(g->flat_hc);
     ds4_gpu_tensor_free(g->cur_hc);
+    free(g->comp_counts_buf);
+    free(g->index_counts_buf);
     memset(g, 0, sizeof(*g));
 }
 
@@ -10137,6 +10141,9 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_mid = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+
+    g->comp_counts_buf = xcalloc(pc, sizeof(uint32_t));
+    g->index_counts_buf = xcalloc(pc, sizeof(uint32_t));
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
@@ -12586,8 +12593,10 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ext_factor != 0.0f && freq_scale > 0.0f) {
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
-    uint32_t *comp_counts = compressed ? xcalloc(n_tokens, sizeof(comp_counts[0])) : NULL;
-    uint32_t *index_counts = ratio == 4 ? xcalloc(n_tokens, sizeof(index_counts[0])) : NULL;
+    uint32_t *comp_counts = compressed ? g->comp_counts_buf : NULL;
+    uint32_t *index_counts = ratio == 4 ? g->index_counts_buf : NULL;
+    if (comp_counts) memset(comp_counts, 0, (size_t)n_tokens * sizeof(comp_counts[0]));
+    if (index_counts) memset(index_counts, 0, (size_t)n_tokens * sizeof(index_counts[0]));
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
     ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
@@ -13913,8 +13922,6 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor_free(attn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
-    free(index_counts);
-    free(comp_counts);
 #undef DS4_METAL_PROFILE_ATTN_STAGE
 #undef DS4_METAL_PROFILE_Q_STAGE
     return ok;
@@ -19443,22 +19450,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (e->mtp_ready &&
-            !ds4_gpu_set_model_map_range(e->mtp_model.map,
-                                           e->mtp_model.size,
-                                           e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.max_tensor_bytes))
-        {
-            fprintf(stderr,
-                    "ds4: %s failed to map MTP model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
-                    ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+        if (e->mtp_ready) {
+            (void)ds4_gpu_set_mtp_fd(e->mtp_model.fd);
+            if (!ds4_gpu_set_model_map_range(e->mtp_model.map,
+                                               e->mtp_model.size,
+                                               e->mtp_model.tensor_data_pos,
+                                               e->mtp_model.size - e->mtp_model.tensor_data_pos,
+                                               e->mtp_model.max_tensor_bytes))
+            {
+                fprintf(stderr,
+                        "ds4: %s failed to map MTP model views; aborting startup. "
+                        "This is commonly caused by insufficient memory or accelerator VM budget.\n",
+                        ds4_backend_name(e->backend));
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
@@ -19477,11 +19486,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
          * model when loaded. */
         if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                              NULL, NULL, 0)) {
-            fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
+            fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache; continuing without caching MTP model tensors on device\n",
                     ds4_backend_name(e->backend));
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));

@@ -5006,6 +5006,11 @@ int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
+int ds4_gpu_set_mtp_fd(int fd) {
+    (void)fd;
+    return 1;
+}
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
