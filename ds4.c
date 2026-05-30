@@ -9427,6 +9427,8 @@ typedef struct {
     bool mtp_enabled;
     uint32_t *comp_counts_buf;
     uint32_t *index_counts_buf;
+    float *spec_row_logits;
+    float *spec_row0_logits;
 } ds4_gpu_graph;
 
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
@@ -9600,6 +9602,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->cur_hc);
     free(g->comp_counts_buf);
     free(g->index_counts_buf);
+    free(g->spec_row_logits);
+    free(g->spec_row0_logits);
     memset(g, 0, sizeof(*g));
 }
 
@@ -10144,6 +10148,8 @@ static bool metal_graph_alloc_raw_cap(
 
     g->comp_counts_buf = xcalloc(pc, sizeof(uint32_t));
     g->index_counts_buf = xcalloc(pc, sizeof(uint32_t));
+    g->spec_row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    g->spec_row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
@@ -20675,7 +20681,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             mtp_last_margin = v0 - v1;
         }
         if (mtp_last_margin < mtp_margin_threshold) {
-            float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+            float *row_logits = s->graph.spec_row_logits;
             const int start = s->checkpoint.len;
             const double verify_t0 = mtp_timing ? now_sec() : 0.0;
             bool ok = metal_graph_eval_token_raw_swa(&s->graph,
@@ -20685,13 +20691,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                      (uint32_t)start,
                                                      row_logits);
             if (!ok) {
-                free(row_logits);
                 snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
                 return -1;
             }
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-            free(row_logits);
             token_vec_push(&s->checkpoint, drafts[0]);
             accepted[n_accept++] = drafts[0];
             s->checkpoint_valid = true;
@@ -20724,8 +20728,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (use_decode2_exact) {
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
-        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
-        float *row0_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
+        float *row_logits = s->graph.spec_row_logits;
+        float *row0_logits = s->graph.spec_row0_logits;
         const int start = s->checkpoint.len;
         int row0_top = -1;
         const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
@@ -20762,8 +20766,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         (now_sec() - mtp_t0) * 1000.0);
             }
             spec_frontier_free(&frontier);
-            free(row0_logits);
-            free(row_logits);
             return n_accept;
         }
 
@@ -20789,8 +20791,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         (replay_done - mtp_t0) * 1000.0);
             }
             spec_frontier_free(&frontier);
-            free(row0_logits);
-            free(row_logits);
             return n_accept;
         }
         if (have_frontier) {
@@ -20798,8 +20798,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             (void)spec_frontier_restore(&frontier, s);
         }
         spec_frontier_free(&frontier);
-        free(row0_logits);
-        free(row_logits);
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp decode2 verifier failed, falling back to sequential\n");
         }
@@ -20810,7 +20808,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
         int *row_tops = xmalloc((size_t)draft_n * sizeof(row_tops[0]));
-        float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
+        float *row_logits = s->graph.spec_row_logits;
         const int start = s->checkpoint.len;
         /*
          * The production MTP depth is two.  Prefix-1 capture makes partial
@@ -20891,7 +20889,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         s->mtp_draft_valid = false;
                         DS4_MTP_KEEP_ACCEPTED(replayed);
                         spec_frontier_free(&frontier);
-                        free(row_logits);
                         free(row_tops);
                         return n_accept;
                     }
@@ -20922,7 +20919,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (now_sec() - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    free(row_logits);
                     free(row_tops);
                     return n_accept;
                 }
@@ -20953,7 +20949,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (now_sec() - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    free(row_logits);
                     free(row_tops);
                     return n_accept;
                 }
@@ -20988,7 +20983,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (replay_done - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    free(row_logits);
                     free(row_tops);
                     return n_accept;
                 }
@@ -21029,7 +21023,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                 (replay_done - mtp_t0) * 1000.0);
                     }
                     spec_frontier_free(&frontier);
-                    free(row_logits);
                     free(row_tops);
                     return n_accept;
                 }
@@ -21046,12 +21039,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             s->checkpoint_valid = false;
             DS4_MTP_KEEP_ACCEPTED(0);
             spec_frontier_free(&frontier);
-            free(row_logits);
             free(row_tops);
             return -1;
         }
         spec_frontier_free(&frontier);
-        free(row_logits);
         free(row_tops);
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp spec micro verifier failed, falling back to sequential\n");
