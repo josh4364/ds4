@@ -3082,10 +3082,12 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     return free_bytes - context_bytes < reserve_bytes;
 }
 
+static __thread ds4_gpu_tensor tls_tensor_view_pool[256];
+static __thread unsigned int tls_tensor_view_idx = 0;
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
-    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
-    if (!t) return NULL;
+    ds4_gpu_tensor *t = &tls_tensor_view_pool[tls_tensor_view_idx++ & 255u];
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
@@ -3095,13 +3097,13 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    int d = ds4_tensor_device_idx(tensor);
     if (tensor->owner && tensor->ptr) {
+        int d = ds4_tensor_device_idx(tensor);
         WITH_DEVICE(g_gpu[d].device_id) {
             (void)cudaFree(tensor->ptr);
         }
+        free(tensor);
     }
-    free(tensor);
 }
 
 extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
