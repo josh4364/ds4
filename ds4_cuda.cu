@@ -3082,12 +3082,12 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     return free_bytes - context_bytes < reserve_bytes;
 }
 
-static __thread ds4_gpu_tensor tls_tensor_view_pool[256];
+static __thread ds4_gpu_tensor tls_tensor_view_pool[65536];
 static __thread unsigned int tls_tensor_view_idx = 0;
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
     if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
-    ds4_gpu_tensor *t = &tls_tensor_view_pool[tls_tensor_view_idx++ & 255u];
+    ds4_gpu_tensor *t = &tls_tensor_view_pool[tls_tensor_view_idx++ & 65535u];
     t->ptr = (char *)base->ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
