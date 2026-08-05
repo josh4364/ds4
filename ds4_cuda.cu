@@ -1177,6 +1177,31 @@ __global__ static void moe_mmq_swiglu_weighted_clamp_kernel(
     mid_out[gid] = s * u * w;
 }
 
+__global__ static void moe_mmq_swiglu_weighted_clamp_decode_fast_kernel(
+        float *mid_out,
+        const float *gate_buf, const float *up_buf,
+        const float *weights,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert_used,
+        float clamp) {
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n = n_expert_used * expert_mid_dim;
+    if (gid >= n) return;
+    uint32_t slot = expert_mid_dim == 2048u ? (gid >> 11u) : (gid / expert_mid_dim);
+    float g = gate_buf[gid];
+    float u = up_buf[gid];
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(u)) u = 0.0f;
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+    const float w = weights[slot];
+    const float s = g / (1.0f + __expf(-g));
+    mid_out[gid] = s * u * w;
+}
+
 __global__ static void moe_mmq_sum_kernel(float *out, const float *down,
         const int32_t *selected, uint32_t out_dim, uint32_t n_expert,
         uint32_t n_tokens, uint32_t guard_nonfinite) {
@@ -23816,12 +23841,21 @@ static int routed_moe_launch(
             if (rc == 0) {
                 const uint64_t mid_floats =
                     slot_count * expert_mid_dim;
-                moe_mmq_swiglu_weighted_clamp_kernel<<<
-                    (uint32_t)((mid_floats + 255u) / 256u), 256, 0, stream>>>(
-                    (float *)mid->ptr,
-                    (const float *)gate->ptr, (const float *)up->ptr,
-                    (const float *)weights->ptr,
-                    expert_mid_dim, n_tokens, n_expert, clamp);
+                if (n_tokens == 1u) {
+                    moe_mmq_swiglu_weighted_clamp_decode_fast_kernel<<<
+                        (uint32_t)((mid_floats + 255u) / 256u), 256, 0, stream>>>(
+                        (float *)mid->ptr,
+                        (const float *)gate->ptr, (const float *)up->ptr,
+                        (const float *)weights->ptr,
+                        expert_mid_dim, n_expert, clamp);
+                } else {
+                    moe_mmq_swiglu_weighted_clamp_kernel<<<
+                        (uint32_t)((mid_floats + 255u) / 256u), 256, 0, stream>>>(
+                        (float *)mid->ptr,
+                        (const float *)gate->ptr, (const float *)up->ptr,
+                        (const float *)weights->ptr,
+                        expert_mid_dim, n_tokens, n_expert, clamp);
+                }
                 rc = cuda_ok(cudaGetLastError(),
                              "mxfp4 moe swiglu launch") ? 0 : -1;
             }
