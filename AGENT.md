@@ -54,3 +54,19 @@ At every major change where one of the following could be affected, make sure to
 2. Test the SSD streaming path.
 3. Test the distributed inference if it could be affected, but ask the user before doing so.
 4. Check if CUDA could be broken after the change, and ask the user to give you access to the CUDA machine to actually test if everything is still fine.
+
+## GPU Profiling & Benchmarking Suite (NVIDIA Grace Blackwell GB10 / CUDA)
+
+For long-context GPU optimization & profiling on NVIDIA CUDA devices, use the automated profiling scripts in the repository root:
+
+- **Microsecond Stage Profiler**: `./profile_stage.sh [max_tokens]`
+  - Runs `ds4-server` with `DS4_CUDA_DECODE_STAGE_PROFILE=1` to log exact per-step stage durations (`decode_attn`, `moe_mmq`, `verify_spec`).
+- **Nsight Systems CLI Trace**: `./profile_nsys.sh [duration_sec]`
+  - Captures Nsight Systems CUDA timeline trace (`.nsys-rep`) during active generation and outputs top GPU kernels sorted by total execution duration.
+- **SplitKV Parameter Sweep**: `./benchmark_sweep.sh`
+  - Sweeps `DS4_CUDA_SPLITKV_CHUNK` configurations (`256`, `512`, `1024`) and generates a comparative prefill/throughput benchmark summary.
+
+### Key CUDA Environment Flags for Benchmark & Production
+- `DS4_CUDA_SPLITKV_SPEC=1`: Enables SplitKV speculative decoding verification.
+- `DS4_DEFAULT_TEMPERATURE=0.0`: Forces deterministic sampling for exact token verification.
+- `OMP_NUM_THREADS=8`, `OPENBLAS_NUM_THREADS=8`: Optimizes CPU thread parallelism for model loading and graph dispatch.
