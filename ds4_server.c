@@ -22,6 +22,7 @@
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -6280,8 +6281,8 @@ static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *
     return ok;
 }
 
-static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
-                                    size_t raw_len, size_t pos) {
+static __attribute__((unused)) bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
+                                                   size_t raw_len, size_t pos) {
     openai_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
     ts->active = true;
@@ -6390,7 +6391,7 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     return true;
 }
 
-static bool openai_tool_stream_update(int fd, server *s, const request *r, const char *id,
+static __attribute__((unused)) bool openai_tool_stream_update(int fd, server *s, const request *r, const char *id,
                                       openai_tool_stream *ts,
                                       const char *raw, size_t raw_len) {
     while (ts->active && ts->parse_pos < raw_len) {
@@ -6470,6 +6471,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                                      openai_stream *st,
                                      const char *raw, size_t raw_len,
                                      bool final) {
+    (void)s;
     if (!st->active || !raw) return true;
 
     if (st->mode == OPENAI_STREAM_THINKING) {
@@ -6546,8 +6548,6 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                 if (limit > st->emit_pos) st->sent_reasoning = true;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
             } else {
                 st->guard_second_reasoning = false;
             }
@@ -6567,19 +6567,10 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
-                st->mode = OPENAI_STREAM_TOOL;
-            } else {
-                st->mode = OPENAI_STREAM_SUPPRESS;
-            }
+            st->mode = OPENAI_STREAM_SUPPRESS;
         } else if (final) {
             st->mode = OPENAI_STREAM_SUPPRESS;
         }
-    }
-
-    if (st->mode == OPENAI_STREAM_TOOL) {
-        if (!openai_tool_stream_update(fd, s, r, id, &st->tool, raw, raw_len)) return false;
-        if (!st->tool.active) st->mode = OPENAI_STREAM_SUPPRESS;
     }
     return true;
 }
@@ -12638,6 +12629,8 @@ static void configure_client_socket(int fd) {
     tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
 static void set_client_socket_nonblocking(int fd) {
