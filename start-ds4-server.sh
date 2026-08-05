@@ -11,7 +11,7 @@ PORT="${DS4_PORT:-${PORT:-8000}}"
 CTX="${DS4_CTX:-${CTX:-32768}}"
 TEMP="${DS4_TEMP:-${TEMP:-0}}"
 MTP_MODEL="${DS4_MTP_MODEL:-${MTP_MODEL:-$ROOT/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf}}"
-MTP_DRAFT="${DS4_MTP_DRAFT:-${MTP_DRAFT:-2}}"
+MTP_DRAFT="${DS4_MTP_DRAFT:-${MTP_DRAFT:-3}}"
 KV_DIR="${DS4_KV_DIR:-${KV_DIR:-$ROOT/kv-cache}}"
 
 # Ensure ds4-server executable exists
