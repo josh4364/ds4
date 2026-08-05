@@ -4876,6 +4876,25 @@ __device__ static float warp_sum_f32(float v) {
     return v;
 }
 
+__device__ static float block_reduce_sum_f32(float v) {
+    __shared__ float shared[32];
+    int lane = threadIdx.x & 31;
+    int wid = threadIdx.x >> 5;
+
+    v = warp_sum_f32(v);
+
+    if (lane == 0) shared[wid] = v;
+    __syncthreads();
+
+    v = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.0f;
+    if (wid == 0) v = warp_sum_f32(v);
+
+    if (threadIdx.x == 0) shared[0] = v;
+    __syncthreads();
+
+    return shared[0];
+}
+
 __device__ static float warp_max_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
@@ -6493,14 +6512,8 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
         float v = xr[i];
         sum += v * v;
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
+    float total_sum = block_reduce_sum_f32(sum);
+    float scale = rsqrtf(total_sum / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
     }
@@ -6518,14 +6531,8 @@ __global__ static void rms_norm_weight_fast4096_kernel(float *out, const float *
     float sum = 0.0f;
 #pragma unroll
     for (uint32_t j = 0; j < 16u; j++) sum += v[j] * v[j];
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / 4096.0f + eps);
+    float total_sum = block_reduce_sum_f32(sum);
+    float scale = rsqrtf(total_sum / 4096.0f + eps);
 #pragma unroll
     for (uint32_t j = 0; j < 16u; j++) {
         uint32_t idx = threadIdx.x + j * 256u;
@@ -6559,14 +6566,8 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         v[k] = idx < n ? xr[idx] : 0.0f;
         sum += v[k] * v[k];
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    float total_sum = block_reduce_sum_f32(sum);
+    const float scale = rsqrtf(total_sum / (float)n + eps);
     for (uint32_t k = 0; k < chunks && k < 16u; k++) {
         uint32_t idx = threadIdx.x + k * 256u;
         if (idx < n) {
@@ -6587,14 +6588,8 @@ __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n
         v[k] = idx < head_dim ? xr[idx] : 0.0f;
         sum += v[k] * v[k];
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    float total_sum = block_reduce_sum_f32(sum);
+    float scale = rsqrtf(total_sum / (float)head_dim + eps);
     for (uint32_t k = 0; k < chunks && k < 4u; k++) {
         uint32_t idx = threadIdx.x + k * 256u;
         if (idx < head_dim) xr[idx] = v[k] * scale;
