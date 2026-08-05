@@ -6551,10 +6551,13 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
     const float *xr = (which == 0u ? q : kv) + (uint64_t)row * n;
     float *orow = (which == 0u ? q_out : kv_out) + (uint64_t)row * n;
     const float *w = which == 0u ? q_w : kv_w;
+    float v[16];
+    const uint32_t chunks = (n + 255u) / 256u;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float v = xr[i];
-        sum += v * v;
+    for (uint32_t k = 0; k < chunks && k < 16u; k++) {
+        uint32_t idx = threadIdx.x + k * 256u;
+        v[k] = idx < n ? xr[idx] : 0.0f;
+        sum += v[k] * v[k];
     }
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
@@ -6564,8 +6567,11 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         __syncthreads();
     }
     const float scale = rsqrtf(partial[0] / (float)n + eps);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        orow[i] = xr[i] * scale * w[i];
+    for (uint32_t k = 0; k < chunks && k < 16u; k++) {
+        uint32_t idx = threadIdx.x + k * 256u;
+        if (idx < n) {
+            orow[idx] = v[k] * scale * w[idx];
+        }
     }
 }
 
@@ -6573,10 +6579,13 @@ __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n
     uint32_t row = blockIdx.x;
     if (row >= n_tok * n_head) return;
     float *xr = x + (uint64_t)row * head_dim;
+    float v[4];
+    const uint32_t chunks = (head_dim + 255u) / 256u;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = xr[i];
-        sum += v * v;
+    for (uint32_t k = 0; k < chunks && k < 4u; k++) {
+        uint32_t idx = threadIdx.x + k * 256u;
+        v[k] = idx < head_dim ? xr[idx] : 0.0f;
+        sum += v[k] * v[k];
     }
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
@@ -6586,7 +6595,10 @@ __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n
         __syncthreads();
     }
     float scale = rsqrtf(partial[0] / (float)head_dim + eps);
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) xr[i] *= scale;
+    for (uint32_t k = 0; k < chunks && k < 4u; k++) {
+        uint32_t idx = threadIdx.x + k * 256u;
+        if (idx < head_dim) xr[idx] = v[k] * scale;
+    }
 }
 
 __device__ static float rope_yarn_ramp_dev(float low, float high, int i0);
