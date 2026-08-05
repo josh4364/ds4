@@ -4922,9 +4922,28 @@ __device__ static float block_reduce_sum_f32(float v) {
 
 __device__ static float warp_max_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
-        v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, offset));
     }
     return v;
+}
+
+__device__ static float block_reduce_max_f32(float v) {
+    __shared__ float shared[32];
+    int lane = threadIdx.x & 31;
+    int wid = threadIdx.x >> 5;
+
+    v = warp_max_f32(v);
+
+    if (lane == 0) shared[wid] = v;
+    __syncthreads();
+
+    v = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : -INFINITY;
+    if (wid == 0) v = warp_max_f32(v);
+
+    if (threadIdx.x == 0) shared[0] = v;
+    __syncthreads();
+
+    return shared[0];
 }
 
 __device__ static float dot4_f32(float4 a, float4 b) {
@@ -9330,7 +9349,18 @@ __global__ static void attention_decode_splitkv_kernel(
         if (g < raw_count) {
             const float *kvrow = raw_kv + (uint64_t)raw_rows[g - raw_lo] * head_dim;
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            if (head_dim == 512u) {
+                const float4 *qh4 = reinterpret_cast<const float4 *>(qh);
+                const float4 *kv4 = reinterpret_cast<const float4 *>(kvrow);
+#pragma unroll
+                for (uint32_t d4 = 0; d4 < 128u; d4++) {
+                    float4 qv = qh4[d4];
+                    float4 kv = kv4[d4];
+                    dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+                }
+            } else {
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            }
             s = dot * scale;
         } else {
             uint32_t c = g - raw_count;
@@ -9339,22 +9369,27 @@ __global__ static void attention_decode_splitkv_kernel(
             if (add > -1.0e20f) {
                 const float *kvrow = comp_kv + (uint64_t)c * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                if (head_dim == 512u) {
+                    const float4 *qh4 = reinterpret_cast<const float4 *>(qh);
+                    const float4 *kv4 = reinterpret_cast<const float4 *>(kvrow);
+#pragma unroll
+                    for (uint32_t d4 = 0; d4 < 128u; d4++) {
+                        float4 qv = qh4[d4];
+                        float4 kv = kv4[d4];
+                        dot += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
+                    }
+                } else {
+                    for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                }
                 s = dot * scale + add;
             }
         }
         scores[i] = s;
         local_max = fmaxf(local_max, s);
     }
-    partial[threadIdx.x] = local_max;
+    float chunk_max = block_reduce_max_f32(local_max);
+    if (threadIdx.x == 0) m_s = chunk_max;
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) m_s = partial[0];
-    __syncthreads();
-    float chunk_max = m_s;
     /* All-masked / empty-chunk guard: never evaluate exp(-INF - -INF) -> NaN.
      * Write zero partial (m=-INF, l=0, acc=0) and return. */
     if (!isfinite(chunk_max)) {
@@ -9365,17 +9400,12 @@ __global__ static void attention_decode_splitkv_kernel(
     /* Pass 2: exponentiate in place and reduce denominator. */
     float den_local = 0.0f;
     for (uint32_t i = threadIdx.x; i < cnt; i += blockDim.x) {
-        float e = expf(scores[i] - chunk_max);
+        float e = __expf(scores[i] - chunk_max);
         scores[i] = e;
         den_local += e;
     }
-    partial[threadIdx.x] = den_local;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) l_s = partial[0];
+    float total_den = block_reduce_sum_f32(den_local);
+    if (threadIdx.x == 0) l_s = total_den;
     __syncthreads();
     /* Pass 3: weighted value accumulation over this chunk's rows (ascending g),
      * preserving raw-then-comp ordering to match the reference accumulation. */
