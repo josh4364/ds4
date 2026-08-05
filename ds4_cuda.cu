@@ -6620,6 +6620,60 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
     }
 }
 
+__global__ static void dsv4_qkv_rms_norm_rows_decode_fast_kernel(
+        float *q_out,
+        const float *q,
+        const float *q_w,
+        uint32_t q_n,
+        float *kv_out,
+        const float *kv,
+        const float *kv_w,
+        uint32_t kv_n,
+        float eps) {
+    const uint32_t which = blockIdx.y;
+    if (which > 1u) return;
+    const uint32_t n = which == 0u ? q_n : kv_n;
+    const float *xr = which == 0u ? q : kv;
+    float *orow = which == 0u ? q_out : kv_out;
+    const float *w = which == 0u ? q_w : kv_w;
+
+    float sum = 0.0f;
+    const uint32_t n4 = n >> 2u;
+    const float4 *x4 = reinterpret_cast<const float4 *>(xr);
+    const float4 *w4 = reinterpret_cast<const float4 *>(w);
+    float4 *o4 = reinterpret_cast<float4 *>(orow);
+
+    const uint32_t chunks4 = (n4 + 255u) / 256u;
+    float4 v[4];
+#pragma unroll
+    for (uint32_t k = 0; k < 4u; k++) {
+        if (k < chunks4) {
+            uint32_t idx = threadIdx.x + k * 256u;
+            v[k] = idx < n4 ? x4[idx] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            sum += v[k].x * v[k].x + v[k].y * v[k].y + v[k].z * v[k].z + v[k].w * v[k].w;
+        }
+    }
+
+    float total_sum = block_reduce_sum_f32(sum);
+    const float scale = rsqrtf(total_sum / (float)n + eps);
+
+#pragma unroll
+    for (uint32_t k = 0; k < 4u; k++) {
+        if (k < chunks4) {
+            uint32_t idx = threadIdx.x + k * 256u;
+            if (idx < n4) {
+                float4 wv = w4[idx];
+                float4 res;
+                res.x = v[k].x * scale * wv.x;
+                res.y = v[k].y * scale * wv.y;
+                res.z = v[k].z * scale * wv.z;
+                res.w = v[k].w * scale * wv.w;
+                o4[idx] = res;
+            }
+        }
+    }
+}
+
 __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= n_tok * n_head) return;
@@ -16284,18 +16338,32 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         const float *kv_w = (const float *)cuda_resolve_weight_ptr(model_map,
                 kv_weight_offset, (uint64_t)kv_n * sizeof(float), logical_tier, "kv_rms_weight");
         if (!q_w || !kv_w) return 0;
-        dim3 grid(rows, 2u, 1u);
-        dsv4_qkv_rms_norm_rows_kernel<<<grid, 256>>>(
-                (float *)q_out->ptr,
-                (const float *)q->ptr,
-                q_w,
-                q_n,
-                (float *)kv_out->ptr,
-                (const float *)kv->ptr,
-                kv_w,
-                kv_n,
-                rows,
-                eps);
+        if (rows == 1u && (q_n & 3u) == 0u && (kv_n & 3u) == 0u) {
+            dim3 grid(1u, 2u, 1u);
+            dsv4_qkv_rms_norm_rows_decode_fast_kernel<<<grid, 256>>>(
+                    (float *)q_out->ptr,
+                    (const float *)q->ptr,
+                    q_w,
+                    q_n,
+                    (float *)kv_out->ptr,
+                    (const float *)kv->ptr,
+                    kv_w,
+                    kv_n,
+                    eps);
+        } else {
+            dim3 grid(rows, 2u, 1u);
+            dsv4_qkv_rms_norm_rows_kernel<<<grid, 256>>>(
+                    (float *)q_out->ptr,
+                    (const float *)q->ptr,
+                    q_w,
+                    q_n,
+                    (float *)kv_out->ptr,
+                    (const float *)kv->ptr,
+                    kv_w,
+                    kv_n,
+                    rows,
+                    eps);
+        }
         return cuda_ok(cudaGetLastError(), "dsv4 qkv rms norm rows launch");
     }
     return ds4_gpu_rms_norm_weight_rows_tensor(q_out, q, model_map, model_size,
