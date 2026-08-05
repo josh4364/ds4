@@ -6628,22 +6628,22 @@ __global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
     const float *xr = (which == 0u ? q : kv) + (uint64_t)row * n;
     float *orow = (which == 0u ? q_out : kv_out) + (uint64_t)row * n;
     const float *w = which == 0u ? q_w : kv_w;
+    float v[16];
+    const uint32_t chunks = (n + 255u) / 256u;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        const float v = xr[i];
-        sum += v * v;
+    for (uint32_t k = 0; k < chunks && k < 16u; k++) {
+        uint32_t idx = threadIdx.x + k * 256u;
+        v[k] = idx < n ? xr[idx] : 0.0f;
+        sum += v[k] * v[k];
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    float total_sum = block_reduce_sum_f32(sum);
+    const float scale = rsqrtf(total_sum / (float)n + eps);
     if (which == 0u) {
-        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-            orow[i] = xr[i] * scale * w[i];
+        for (uint32_t k = 0; k < chunks && k < 16u; k++) {
+            uint32_t idx = threadIdx.x + k * 256u;
+            if (idx < n) {
+                orow[idx] = v[k] * scale * w[idx];
+            }
         }
         return;
     }
