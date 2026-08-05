@@ -12240,6 +12240,17 @@ __global__ static void add_kernel(float *out, const float *a, const float *b, ui
     out[i] = a[i] + b[i];
 }
 
+__global__ static void add_vec4_kernel(float *out, const float *a, const float *b, uint32_t n4) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    const float4 *a4 = reinterpret_cast<const float4 *>(a);
+    const float4 *b4 = reinterpret_cast<const float4 *>(b);
+    float4 *o4 = reinterpret_cast<float4 *>(out);
+    float4 va = a4[i];
+    float4 vb = b4[i];
+    o4[i] = make_float4(va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w);
+}
+
 __global__ static void directional_steering_project_kernel(
         float       *x,
         const float *directions,
@@ -18829,7 +18840,12 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, 
         out->bytes < (uint64_t)n * sizeof(float) ||
         a->bytes < (uint64_t)n * sizeof(float) ||
         b->bytes < (uint64_t)n * sizeof(float)) return 0;
-    add_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+    if ((n & 3u) == 0u) {
+        uint32_t n4 = n >> 2u;
+        add_vec4_kernel<<<(n4 + 255u) / 256u, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n4);
+    } else {
+        add_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+    }
     return cuda_ok(cudaGetLastError(), "add launch");
 }
 
