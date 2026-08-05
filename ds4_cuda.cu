@@ -11971,8 +11971,8 @@ __global__ static void compressor_shift_ratio4_kernel(float *state_kv, float *st
 
 __device__ static float softplus_dev(float x) {
     if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return log1pf(expf(x));
+    if (x < -20.0f) return __expf(x);
+    return log1pf(__expf(x));
 }
 
 __global__ static void router_select_kernel(
@@ -12209,8 +12209,29 @@ __global__ static void swiglu_kernel(float *out, const float *gate, const float 
         g = fminf(g, clamp);
         u = fminf(fmaxf(u, -clamp), clamp);
     }
-    float s = g / (1.0f + expf(-g));
+    float s = g / (1.0f + __expf(-g));
     out[i] = s * u * weight;
+}
+
+__global__ static void swiglu_vec4_kernel(float *out, const float *gate, const float *up, uint32_t n4, float clamp, float weight) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    const float4 *g4 = reinterpret_cast<const float4 *>(gate);
+    const float4 *u4 = reinterpret_cast<const float4 *>(up);
+    float4 *o4 = reinterpret_cast<float4 *>(out);
+
+    float4 g = g4[i];
+    float4 u = u4[i];
+    if (clamp > 1.0e-6f) {
+        g.x = fminf(g.x, clamp); g.y = fminf(g.y, clamp); g.z = fminf(g.z, clamp); g.w = fminf(g.w, clamp);
+        u.x = fminf(fmaxf(u.x, -clamp), clamp); u.y = fminf(fmaxf(u.y, -clamp), clamp);
+        u.z = fminf(fmaxf(u.z, -clamp), clamp); u.w = fminf(fmaxf(u.w, -clamp), clamp);
+    }
+    float s_x = g.x / (1.0f + __expf(-g.x));
+    float s_y = g.y / (1.0f + __expf(-g.y));
+    float s_z = g.z / (1.0f + __expf(-g.z));
+    float s_w = g.w / (1.0f + __expf(-g.w));
+    o4[i] = make_float4(s_x * u.x * weight, s_y * u.y * weight, s_z * u.z * weight, s_w * u.w * weight);
 }
 
 __global__ static void add_kernel(float *out, const float *a, const float *b, uint32_t n) {
@@ -18682,7 +18703,12 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
         out->bytes < (uint64_t)n * sizeof(float) ||
         gate->bytes < (uint64_t)n * sizeof(float) ||
         up->bytes < (uint64_t)n * sizeof(float)) return 0;
-    swiglu_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
+    if ((n & 3u) == 0u) {
+        uint32_t n4 = n >> 2u;
+        swiglu_vec4_kernel<<<(n4 + 255u) / 256u, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n4, clamp, weight);
+    } else {
+        swiglu_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
+    }
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
