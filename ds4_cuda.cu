@@ -8784,7 +8784,6 @@ __global__ static void attention_decode_global_softmax_kernel(
     const uint32_t h = blockIdx.x;
     if (h >= n_head || n_score == 0u || n_score > DS4_CUDA_ATTENTION_SCORE_CAP) return;
     __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
-    __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom_s;
     const uint32_t score_threads = blockDim.x > 256u ? 256u : blockDim.x;
@@ -8798,34 +8797,23 @@ __global__ static void attention_decode_global_softmax_kernel(
             scores[i] = s;
             local_max = fmaxf(local_max, s);
         }
-        partial[threadIdx.x] = local_max;
+    } else {
+        local_max = -INFINITY;
     }
-    __syncthreads();
-    for (uint32_t stride = score_threads >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            partial[threadIdx.x] =
-                fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) max_s = partial[0];
+    float block_max = block_reduce_max_f32(local_max);
+    if (threadIdx.x == 0) max_s = block_max;
     __syncthreads();
 
     float den_local = 0.0f;
     if (score_thread) {
         for (uint32_t i = threadIdx.x; i < n_score; i += score_threads) {
-            const float e = expf(scores[i] - max_s);
+            const float e = __expf(scores[i] - max_s);
             scores[i] = e;
             den_local += e;
         }
-        partial[threadIdx.x] = den_local;
     }
-    __syncthreads();
-    for (uint32_t stride = score_threads >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) denom_s = partial[0] + expf(sinks[h] - max_s);
+    float block_sum = block_reduce_sum_f32(den_local);
+    if (threadIdx.x == 0) denom_s = block_sum + __expf(sinks[h] - max_s);
     __syncthreads();
 
     if (score_thread) {
