@@ -810,6 +810,19 @@ static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders
     return idx >= 0 ? &orders->v[idx] : NULL;
 }
 
+static float g_server_default_temp = -1.0f;
+
+static float server_get_default_temperature(void) {
+    if (g_server_default_temp >= 0.0f) return g_server_default_temp;
+    const char *env = getenv("DS4_DEFAULT_TEMPERATURE");
+    if (env && env[0]) {
+        char *end = NULL;
+        float v = strtof(env, &end);
+        if (end != env && v >= 0.0f) return v;
+    }
+    return DS4_DEFAULT_TEMPERATURE;
+}
+
 static void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
@@ -818,7 +831,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->model = xstrdup("deepseek-v4-flash");
     r->max_tokens = max_tokens;
     r->top_k = 0;
-    r->temperature = DS4_DEFAULT_TEMPERATURE;
+    r->temperature = server_get_default_temperature();
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_HIGH;
@@ -11533,7 +11546,7 @@ decode_again:
              * only for knobs the client left out: an explicit request value
              * (e.g. temperature 0 from a benchmark harness) must win, or the
              * same greedy request returns different text on every call. */
-            if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
+            if (!j->req.temperature_set) temperature = server_get_default_temperature();
             if (!j->req.top_k_set) top_k = 0;
             if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
             if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
@@ -12858,6 +12871,8 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--temp") || !strcmp(arg, "--temperature")) {
+            g_server_default_temp = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
