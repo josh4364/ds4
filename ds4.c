@@ -51931,11 +51931,8 @@ static int ds4_session_eval_splitkv_spec_after_first(
 
     const bool toponly_row0 =
         metal_graph_cuda_splitkv_spec_toponly_row0_requested();
-    float *row0_logits = toponly_row0
-        ? NULL
-        : xmalloc((size_t)DS4_N_VOCAB * sizeof(row0_logits[0]));
-    float *row1_logits =
-        xmalloc((size_t)DS4_N_VOCAB * sizeof(row1_logits[0]));
+    float *row0_logits = toponly_row0 ? NULL : s->graph.spec_row0_logits;
+    float *row1_logits = s->graph.spec_row_logits;
     int row0_top = -1;
     bool ok = metal_graph_verify_decode2_exact(&s->graph,
                                                &e->model,
@@ -51953,8 +51950,6 @@ static int ds4_session_eval_splitkv_spec_after_first(
         snprintf(err, errlen, "%s split-kv spec exact verifier failed",
                  ds4_backend_name(e->backend));
         s->checkpoint_valid = false;
-        free(row1_logits);
-        free(row0_logits);
         spec_frontier_free(&frontier);
         return -1;
     }
@@ -51984,7 +51979,6 @@ static int ds4_session_eval_splitkv_spec_after_first(
                          "%s split-kv spec row0 exact replay failed",
                          ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
-                free(row1_logits);
                 spec_frontier_free(&frontier);
                 return -1;
             }
@@ -51994,8 +51988,6 @@ static int ds4_session_eval_splitkv_spec_after_first(
                 snprintf(err, errlen, "%s split-kv spec prefix commit failed",
                          ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
-                free(row1_logits);
-                free(row0_logits);
                 spec_frontier_free(&frontier);
                 return -1;
             }
@@ -59690,11 +59682,12 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
-    float *scratch = xmalloc((size_t)n_vocab * sizeof(scratch[0]));
+    static __thread float tls_sample_scratch[131072];
+    float *scratch = ((size_t)n_vocab <= 131072u) ? tls_sample_scratch : xmalloc((size_t)n_vocab * sizeof(scratch[0]));
     const int token = sample_top_p_min_p(logits, (uint32_t)n_vocab,
                                          temperature, top_k, top_p, min_p,
                                          rng, scratch);
-    free(scratch);
+    if (scratch != tls_sample_scratch) free(scratch);
     return token;
 }
 
